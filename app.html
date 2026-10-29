@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QR Code Safety Checker</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 0 auto; padding: 16px; line-height: 1.5; color: #222; }
+  h1 { font-size: 1.6rem; }
+  section { margin-bottom: 24px; }
+  button { padding: 8px 14px; margin: 4px 4px 4px 0; border: 1px solid #888; border-radius: 6px; background: #f4f4f4; cursor: pointer; font-size: 0.95rem; }
+  button:hover { background: #e8e8e8; }
+  #video, #preview { width: 100%; max-width: 400px; border-radius: 6px; display: none; }
+  #preview { display: none; }
+  canvas { display: none; }
+  pre { white-space: pre-wrap; word-break: break-all; background: #f7f7f7; padding: 12px; border-radius: 6px; border: 1px solid #ddd; }
+  .result { padding: 12px 14px; border-radius: 6px; margin-top: 12px; font-weight: 600; }
+  .Safe { background: #e6f7ea; border: 1px solid #5cb85c; color: #1e5b26; }
+  .Caution { background: #fff6e0; border: 1px solid #f0ad4e; color: #7a5200; }
+  .Suspicious { background: #fde8e8; border: 1px solid #d9534f; color: #7a1f1c; }
+  ul { padding-left: 20px; }
+  li { margin-bottom: 6px; }
+  .note { font-size: 0.85rem; color: #555; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+
+<h1>QR Code Safety Checker</h1>
+<p>Scan or upload a QR code to see what it contains and whether the destination looks suspicious. The content is shown as plain text and is never opened automatically.</p>
+
+<section>
+  <h2>1. Provide a QR code</h2>
+  <button id="btnCamera">Scan with camera</button>
+  <button id="btnStop" class="hidden">Stop camera</button>
+  <label><button type="button" onclick="document.getElementById('fileInput').click()">Upload image</button></label>
+  <input type="file" id="fileInput" accept="image/*" class="hidden">
+  <video id="video" playsinline muted></video>
+  <img id="preview" alt="Uploaded QR code preview">
+  <canvas id="canvas"></canvas>
+</section>
+
+<section>
+  <h2>2. Or try a sample</h2>
+  <p class="note">These samples use reserved test domains and non-resolving addresses only.</p>
+  <button data-sample="https://example.com">Legitimate link</button>
+  <button data-sample="http://192.0.2.10/login">Raw IP login</button>
+  <button data-sample="https://paypal-account-verify.example.org/urgent-update">Look-alike brand</button>
+  <button data-sample="http://bit.ly/example-test">Shortened link</button>
+  <button data-sample="Your package is waiting. Reply with your address to claim it.">Plain text</button>
+</section>
+
+<section id="resultSection" class="hidden">
+  <h2>Result</h2>
+  <h3>Decoded content</h3>
+  <pre id="decoded"></pre>
+  <div id="riskBox" class="result"></div>
+  <h3>Why</h3>
+  <ul id="reasons"></ul>
+  <h3>What to do next</h3>
+  <p id="advice"></p>
+</section>
+
+<p class="note">Reminder: these automated checks are indicative only. They cannot guarantee that a QR code is safe or malicious.</p>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
+<script>
+// ---------------------------------------------------------------------------
+// URL analysis
+// ---------------------------------------------------------------------------
+const SHORTENERS = ["bit.ly","tinyurl.com","t.co","goo.gl","ow.ly","is.gd","buff.ly","rebrand.ly","cutt.ly","shorturl.at","tiny.cc","rb.gy"];
+const BRANDS = ["paypal","google","apple","microsoft","amazon","facebook","instagram","netflix","whatsapp","outlook","gmail","dropbox","linkedin","sbi","hdfc","icici","axis","paytm"];
+const KEYWORDS = ["verify","login","signin","sign-in","urgent","secure-update","update","account","confirm","password","suspend","locked","prize","winner","claim","free"];
+const REDIRECT_PARAMS = ["redirect","redirect_url","url","next","return","continue"];
+const CHAR_SWAPS = { "0":"o", "1":"l", "3":"e", "5":"s", "@":"a", "vv":"w", "rn":"m" };
+const MULTI_PART_SLDS = ["co","com","org","net","gov","edu","ac"];
+const WEIGHTS = { noHttps:1, port:2, rawIp:3, shortener:2, lookalike:4, brandSub:3, subs:2, long:1, hyphens:1, at:3, encoded:2, keyword:1, punycode:3, redirect:2 };
+
+function normalize(s) {
+  s = s.toLowerCase();
+  for (const [fake, real] of Object.entries(CHAR_SWAPS)) s = s.split(fake).join(real);
+  return s.split("-").join("");
+}
+
+function splitHost(host) {
+  const labels = host.split(".");
+  if (labels.length < 2) return { subs: [], core: labels[0] };
+  const n = labels.length;
+  const coreIdx = (n >= 3 && MULTI_PART_SLDS.includes(labels[n-2]) && labels[n-1].length === 2) ? n-3 : n-2;
+  return { subs: labels.slice(0, coreIdx), core: labels[coreIdx] };
+}
+
+function analyzeUrl(text) {
+  const reasons = [];
+  let score = 0;
+  const add = (key, msg) => { reasons.push(msg); score += WEIGHTS[key]; };
+
+  let u;
+  try { u = new URL(text); } catch { return null; }
+  const host = u.hostname;
+
+  if (u.protocol === "http:") add("noHttps", "The link uses plain HTTP instead of HTTPS, so the traffic can be read or altered.");
+  if (u.port && u.port !== "80" && u.port !== "443") add("port", `The link uses an unusual port (${u.port}), which fake login servers often use.`);
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.startsWith("[")) add("rawIp", "The link points to a raw IP address instead of a domain name.");
+  if (SHORTENERS.includes(host)) add("shortener", "This is a URL shortener, so the real destination is hidden until you click.");
+
+  const { subs, core } = splitHost(host);
+  if (!BRANDS.includes(core)) {
+    const coreNorm = normalize(core);
+    if (BRANDS.some(b => coreNorm.includes(b))) {
+      add("lookalike", `The domain "${core}" imitates a well-known brand using extra words, hyphens, or character swaps.`);
+    } else {
+      const subHit = subs.map(s => normalize(s)).find(s => BRANDS.some(b => s.includes(b)));
+      if (subHit) add("brandSub", "A brand name appears in a subdomain, while the real domain is different. This is a common trick.");
+    }
+  }
+  if (subs.length > 3) add("subs", `The hostname has ${subs.length} subdomain levels, which is often used to hide the real domain.`);
+  if (text.length > 100) add("long", `The link is ${text.length} characters long, which can hide the real destination.`);
+  if (host.split("-").length - 1 >= 3) add("hyphens", "The domain contains several hyphens, a pattern common in fake sites.");
+  if (text.includes("@")) add("at", "The link contains an '@' symbol. Browsers ignore everything before it, so the real destination may differ from what it looks like.");
+  if (/%[0-9A-Fa-f]{2}/.test(text)) add("encoded", "The link contains percent-encoded characters, which can hide keywords from filters.");
+
+  const lower = text.toLowerCase();
+  const hits = KEYWORDS.filter(k => lower.includes(k));
+  if (hits.length) add("keyword", `The link contains urgency or login-related words: ${hits.slice(0,3).map(h => `"${h}"`).join(", ")}.`);
+
+  if (host.includes("xn--")) add("punycode", "The domain uses punycode (xn--), which can make letters look like familiar ones.");
+  const keys = [...u.searchParams.keys()].map(k => k.toLowerCase());
+  if (keys.some(k => REDIRECT_PARAMS.includes(k))) add("redirect", "The link has a redirect parameter, which attackers use to bounce you through trusted sites.");
+
+  return { reasons, score };
+}
+
+function levelFor(score) {
+  if (score <= 2) return "Safe";
+  if (score <= 5) return "Caution";
+  return "Suspicious";
+}
+
+function adviceFor(level, isUrl) {
+  if (!isUrl) return "This is plain text. Don't act on any instructions in it, such as sending personal details or making a payment, until you've confirmed the sender.";
+  if (level === "Safe") return "No common warning signs were found. This does not prove the link is safe. If you weren't expecting it, type the official address yourself instead of opening it.";
+  if (level === "Caution") return "Some warning signs were found. Don't enter passwords or personal information. Confirm where the code came from before opening the link.";
+  return "Strong warning signs were found. Don't open the link or enter any information. Report it to the source or your IT team and avoid scanning similar codes.";
+}
+
+// ---------------------------------------------------------------------------
+// Decoded content handling
+// ---------------------------------------------------------------------------
+function showResult(text) {
+  const isUrl = /^[a-z][a-z0-9+.-]*:\/\//i.test(text.trim());
+  let level = "Safe", reasons = [];
+
+  if (isUrl) {
+    const r = analyzeUrl(text.trim());
+    if (r) {
+      level = levelFor(r.score);
+      reasons = r.reasons;
+    } else {
+      level = "Caution";
+      reasons = ["The content looks like a link but could not be parsed."];
+    }
+  } else {
+    const hits = KEYWORDS.filter(k => text.toLowerCase().includes(k));
+    if (hits.length) {
+      level = "Caution";
+      reasons = [`The text contains urgency or login-related words: ${hits.slice(0,3).map(h => `"${h}"`).join(", ")}.`];
+    } else {
+      reasons = ["The content is plain text, not a link."];
+    }
+  }
+
+  document.getElementById("resultSection").classList.remove("hidden");
+  // textContent keeps decoded content as plain text. It is never turned into a clickable link.
+  document.getElementById("decoded").textContent = text;
+  const box = document.getElementById("riskBox");
+  box.className = "result " + level;
+  box.textContent = `Risk level: ${level}`;
+  const list = document.getElementById("reasons");
+  list.innerHTML = "";
+  (reasons.length ? reasons : ["No common warning signs were found."]).forEach(r => {
+    const li = document.createElement("li");
+    li.textContent = r;
+    list.appendChild(li);
+  });
+  document.getElementById("advice").textContent = adviceFor(level, isUrl);
+  document.getElementById("resultSection").scrollIntoView({ behavior: "smooth" });
+}
+
+// ---------------------------------------------------------------------------
+// Decoding from an image element or canvas
+// ---------------------------------------------------------------------------
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+function decodeFromSource(source, w, h) {
+  canvas.width = w;
+  canvas.height = h;
+  ctx.drawImage(source, 0, 0, w, h);
+  const data = ctx.getImageData(0, 0, w, h);
+  const code = jsQR(data.data, w, h);
+  return code ? code.data : null;
+}
+
+function handleImage(img) {
+  const code = decodeFromSource(img, img.naturalWidth || img.width, img.naturalHeight || img.height);
+  if (code === null) {
+    alert("No QR code was found in this image. Try a clearer or closer photo.");
+    return;
+  }
+  showResult(code);
+}
+
+// ---------------------------------------------------------------------------
+// Upload
+// ---------------------------------------------------------------------------
+document.getElementById("fileInput").addEventListener("change", e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const preview = document.getElementById("preview");
+  preview.src = URL.createObjectURL(file);
+  preview.style.display = "block";
+  preview.onload = () => handleImage(preview);
+});
+
+// ---------------------------------------------------------------------------
+// Camera scanning (requires HTTPS)
+// ---------------------------------------------------------------------------
+let stream = null, scanning = false;
+const video = document.getElementById("video");
+
+async function startCamera() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    alert("Camera access is not available here. Use HTTPS and a supported browser, or upload an image.");
+    return;
+  }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+  } catch {
+    alert("Camera permission was denied or no camera was found. You can upload an image instead.");
+    return;
+  }
+  video.srcObject = stream;
+  video.style.display = "block";
+  await video.play();
+  document.getElementById("btnCamera").classList.add("hidden");
+  document.getElementById("btnStop").classList.remove("hidden");
+  scanning = true;
+  scanLoop();
+}
+
+function stopCamera() {
+  scanning = false;
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null;
+  video.style.display = "none";
+  document.getElementById("btnCamera").classList.remove("hidden");
+  document.getElementById("btnStop").classList.add("hidden");
+}
+
+function scanLoop() {
+  if (!scanning) return;
+  if (video.readyState === video.HAVE_ENOUGH_DATA) {
+    const w = video.videoWidth, h = video.videoHeight;
+    const code = decodeFromSource(video, w, h);
+    if (code !== null) {
+      stopCamera();
+      showResult(code);
+      return;
+    }
+  }
+  requestAnimationFrame(scanLoop);
+}
+
+document.getElementById("btnCamera").addEventListener("click", startCamera);
+document.getElementById("btnStop").addEventListener("click", stopCamera);
+
+// ---------------------------------------------------------------------------
+// Sample QR codes generated in the browser, then decoded with the same pipeline
+// ---------------------------------------------------------------------------
+document.querySelectorAll("button[data-sample]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const text = btn.dataset.sample;
+    const qr = qrcode(0, "M");
+    qr.addData(text);
+    qr.make();
+    const img = new Image();
+    img.onload = () => {
+      const preview = document.getElementById("preview");
+      preview.src = img.src;
+      preview.style.display = "block";
+      handleImage(img);
+    };
+    img.src = qr.createDataURL(6, 4);
+  });
+});
+</script>
+</body>
+</html>
